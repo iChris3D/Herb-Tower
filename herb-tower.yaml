@@ -1,0 +1,379 @@
+esphome:
+  name: herb-tower
+  friendly_name: Herb Tower
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+  
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+web_server:
+  port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  manual_ip:
+    static_ip: 192.168.0.9
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+    # DNS required to get internet time
+    dns1: 8.8.8.8
+    dns2: 1.1.1.1
+
+  ap:
+    ssid: "Herb Tower Fallback"
+    password: "password123"
+
+captive_portal:
+
+# =========================================
+# DEEP SLEEP CONFIGURATION
+# =========================================
+deep_sleep:
+  id: sleep_control
+  # Stays awake for 60 seconds to connect to Wi-Fi and report battery
+  run_duration: 90s 
+  # Sleeps for 59 minutes before waking up again
+  sleep_duration: 59min
+
+globals:
+  - id: interval_hours
+    type: int
+    initial_value: '6'  
+    restore_value: true
+
+  - id: runtime_minutes
+    type: int
+    initial_value: '5'
+    restore_value: true
+    
+  - id: last_scheduled_run
+    type: int
+    initial_value: '-1' 
+    restore_value: true
+
+  - id: last_actual_run_hour
+    type: int
+    initial_value: '-1'
+    restore_value: true
+    
+  - id: last_actual_run_minute
+    type: int
+    initial_value: '0'
+    restore_value: true
+
+  - id: previous_voltage
+    type: float
+    initial_value: '0.0'
+    restore_value: true  # Remembers this through deep sleep
+
+  - id: has_checked_charge
+    type: bool
+    initial_value: 'false'
+    # No restore_value here, so it resets to 'false' every time it wakes up
+
+text_sensor:
+  - platform: template
+    name: "Last Run Time"
+    id: last_run_text
+    icon: "mdi:clock-check-outline"
+    update_interval: 60s
+    lambda: |-
+      if (id(last_actual_run_hour) == -1) return {"Never"};
+      char buffer[8];
+      sprintf(buffer, "%02d:%02d", id(last_actual_run_hour), id(last_actual_run_minute));
+      return {buffer};
+      
+  - platform: template
+    name: "Next Scheduled Runs"
+    id: next_run_text
+    icon: "mdi:clock-outline"
+    update_interval: 10s
+    lambda: |-
+      if (!id(system_time).now().is_valid()) return {"Unknown"};
+      auto now = id(system_time).now();
+      int interval = id(interval_hours);
+      std::string result = "";
+      for (int i = 0; i < 24; i += interval) {
+        if (result.length() > 0) result += ", ";
+        char buffer[6];
+        sprintf(buffer, "%02d:00", i);
+        result += buffer;
+      }
+      return {result};
+
+  - platform: template
+    name: "Last Wake Time"
+    id: last_wake_text
+    icon: "mdi:eye-refresh-outline"
+
+  - platform: template
+    name: "Last Charging Detected"
+    id: last_charged_text
+    icon: "mdi:solar-power"
+    
+number:            
+  - platform: template
+    name: "Pump Interval Hours"
+    id: interval_input
+    optimistic: true
+    min_value: 1
+    max_value: 24
+    step: 1
+    initial_value: 6
+    on_value:
+      then:
+        - lambda: |-
+            id(interval_hours) = (int)x;
+            if (24 % id(interval_hours) != 0) {
+              int closest = id(interval_hours);
+              for (int i = id(interval_hours) - 1; i >= 1; i--) {
+                if (24 % i == 0 && 24 / i <= id(interval_hours) + 2) {
+                  closest = i;
+                  break;
+                }
+              }
+              id(interval_hours) = closest;
+            }
+            ESP_LOGI("schedule", "Interval set to every %d hours", id(interval_hours));
+
+  - platform: template
+    name: "Pump Runtime (min)"
+    id: runtime_input
+    optimistic: true
+    min_value: 1
+    max_value: 30
+    step: 1
+    initial_value: 2
+    on_value:
+      then:
+        - lambda: |-
+            id(runtime_minutes) = (int)x;
+            ESP_LOGI("schedule", "Runtime set to %d minutes", id(runtime_minutes));
+
+time:
+  - platform: sntp
+    timezone: Europe/Nicosia
+    id: system_time
+    on_time_sync:
+      then:
+        - lambda: |-
+            auto now = id(system_time).now();
+            char buffer[10];
+            sprintf(buffer, "%02d:%02d:%02d", now.hour, now.minute, now.second);
+            id(last_wake_text).publish_state(buffer);
+            ESP_LOGI("sleep", "Device woke up and synced time at %s", buffer);
+            
+        - lambda: |-
+            auto now = id(system_time).now();
+            int current_hour = now.hour;
+            
+            if (current_hour % id(interval_hours) == 0 && current_hour != id(last_scheduled_run)) {
+              ESP_LOGI("schedule", "Woke up in a scheduled hour (%02d:xx). Running pump!", current_hour);
+              id(last_scheduled_run) = current_hour;
+              id(run_pump).execute();
+            }
+    
+output:
+  # The Forward Pin will be our "Dimmer" to fade the motor up
+  - platform: ledc
+    pin: GPIO03
+    id: motor_forward_pin
+    frequency: 1000 Hz
+  
+  # The Reverse Pin just needs to be a standard on/off switch held to LOW (Ground)
+  - platform: gpio
+    pin: GPIO04
+    id: motor_reverse_pin
+
+light:
+  # --- NEW: Trick ESPHome into treating the pump like a dimmable bulb ---
+  - platform: monochromatic
+    output: motor_forward_pin
+    name: "Pump Dimmer"
+    id: pump_dimmer
+    internal: true
+
+script:
+  - id: run_pump
+    mode: restart
+    then:
+      # Block sleep while pumping
+      - deep_sleep.prevent: sleep_control
+      
+      - if:
+          condition:
+            - lambda: 'return id(pump_enable_switch).state;'
+          then:
+            - lambda: |-
+                if (id(system_time).now().is_valid()) {
+                  auto now = id(system_time).now();
+                  id(last_actual_run_hour) = now.hour;
+                  id(last_actual_run_minute) = now.minute;
+                }
+            - component.update: last_run_text
+            
+            - if:
+                condition:
+                  - lambda: 'return id(battery_voltage).state > 3.2;'
+                then:
+                  - output.turn_off: motor_reverse_pin
+                  - light.turn_on:
+                      id: pump_dimmer
+                      brightness: 90%  # Keeping the brownout fix! Adjust to your needs.
+                      transition_length: 2s
+                  
+                  # Run the pump for your set duration
+                  - delay: !lambda "return id(runtime_minutes) * 60 * 1000;"
+                  
+                  # --- THE SOFT STOP ---
+                  - light.turn_off:
+                      id: pump_dimmer
+                      transition_length: 2s
+                  - delay: 2s
+                  - output.turn_off: motor_forward_pin
+
+                else:
+                  - logger.log: "WARNING: Battery too low! Skipping pump cycle."
+          else:
+            - logger.log: "INFO: Pump is disabled via dashboard switch."
+
+      # Allow sleep again when done
+      - deep_sleep.allow: sleep_control
+
+switch:
+  - platform: template
+    name: "Run Pump Now"
+    id: manual_pump_switch
+    icon: "mdi:water-pump"
+    lambda: |-
+      return id(run_pump).is_running();
+    turn_on_action:
+      - script.execute: run_pump
+    turn_off_action:
+      - script.stop: run_pump
+      # Kill the pump immediately if manually stopped
+      - light.turn_off:
+          id: pump_dimmer
+          transition_length: 0s
+
+  - platform: template
+    name: "Pump Master Enable"
+    id: pump_enable_switch
+    icon: "mdi:toggle-switch"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # --- NEW: Maintenance Mode Toggle ---
+  - platform: template
+    name: "Prevent Sleep (Maintenance Mode)"
+    id: prevent_sleep_switch
+    icon: "mdi:sleep-off"
+    optimistic: true
+    turn_on_action:
+      - deep_sleep.prevent: sleep_control
+      - logger.log: "Maintenance Mode ON: Sleep prevented."
+    turn_off_action:
+      - deep_sleep.allow: sleep_control
+      - logger.log: "Maintenance Mode OFF: Sleep allowed."
+
+sensor:
+  - platform: adc
+    pin: GPIO0
+    name: "Battery Voltage"
+    id: battery_voltage
+    update_interval: 10s
+    attenuation: 12db 
+    filters:
+      - multiply: 2.0
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+    # --- NEW: Check for charging when the voltage is read ---
+    on_value:
+      then:
+        - lambda: |-
+            // If we already checked this during this 60-second awake window, ignore.
+            if (id(has_checked_charge)) return; 
+            
+            // Wait until we have a valid time from the Wi-Fi
+            if (!id(system_time).now().is_valid()) return;
+            
+            float current_v = x;
+            float prev_v = id(previous_voltage);
+            
+            // Lock out further checks until the next deep sleep cycle
+            id(has_checked_charge) = true; 
+            
+            // If this is the very first boot, just save it and exit
+            if (prev_v == 0.0) {
+              id(previous_voltage) = current_v;
+              return;
+            }
+            
+            // If the voltage went up by at least 0.04V, the sun is shining!
+            if (current_v > (prev_v + 0.04)) {
+              auto now = id(system_time).now();
+              char buffer[10];
+              sprintf(buffer, "%02d:%02d", now.hour, now.minute);
+              id(last_charged_text).publish_state(buffer);
+              ESP_LOGI("solar", "Charging detected! Voltage rose from %.2f to %.2f", prev_v, current_v);
+            }
+            
+            // Save the current voltage to check against next hour
+            id(previous_voltage) = current_v;
+
+# --- NEW: Solar Panel Voltage (22k / 10k Divider) ---
+  - platform: adc
+    pin: GPIO1
+    name: "Charging Voltage (USB⁄SUN)"
+    id: charging_voltage
+    update_interval: 10s
+    attenuation: 12db 
+    filters:
+      # --- CALIBRATED: Perfectly matched to your multimeter! ---
+      - multiply: 3.229 
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+
+  - platform: template
+    name: "Battery Percentage"
+    id: battery_percentage
+    unit_of_measurement: "%"
+    icon: "mdi:battery"
+    accuracy_decimals: 0
+    update_interval: 15s
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (isnan(v)) return v; 
+      float pct = (v - 3.2) / (4.2 - 3.2) * 100.0;
+      if (pct > 100.0) return 100.0;
+      if (pct < 0.0) return 0.0;
+      return pct;
+
+  - platform: template
+    name: "Estimated Runtime (No Sun)"
+    id: battery_runtime_hours
+    unit_of_measurement: "Hours"
+    icon: "mdi:timer-sand"
+    accuracy_decimals: 0  # <-- Changed to 0 decimals
+    update_interval: 15s
+    lambda: |-
+      float pct = id(battery_percentage).state;
+      if (isnan(pct)) return pct; 
+      
+      float hours_left = (pct / 100.0) * 120.0;
+      
+      // <-- NEW: Round to the nearest whole hour before sending
+      return round(hours_left);
