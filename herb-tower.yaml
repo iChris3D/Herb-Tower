@@ -211,26 +211,31 @@ script:
       # Block sleep while pumping
       - deep_sleep.prevent: sleep_control
       
+      # --- NEW: Give the ADC sensor 5 seconds to wake up and get a stable battery reading! ---
+      - delay: 5s 
+      
       - if:
           condition:
             - lambda: 'return id(pump_enable_switch).state;'
           then:
-            - lambda: |-
-                if (id(system_time).now().is_valid()) {
-                  auto now = id(system_time).now();
-                  id(last_actual_run_hour) = now.hour;
-                  id(last_actual_run_minute) = now.minute;
-                }
-            - component.update: last_run_text
-            
             - if:
                 condition:
                   - lambda: 'return id(battery_voltage).state > 3.2;'
                 then:
+                  # --- MOVED: Only update the dashboard time IF the battery passes the test! ---
+                  - lambda: |-
+                      if (id(system_time).now().is_valid()) {
+                        auto now = id(system_time).now();
+                        id(last_actual_run_hour) = now.hour;
+                        id(last_actual_run_minute) = now.minute;
+                      }
+                  - component.update: last_run_text
+                  
+                  # --- THE MAGIC SOFT START ---
                   - output.turn_off: motor_reverse_pin
                   - light.turn_on:
                       id: pump_dimmer
-                      brightness: 90%  # Keeping the brownout fix! Adjust to your needs.
+                      brightness: 90%  # Keeping the brownout fix!
                       transition_length: 2s
                   
                   # Run the pump for your set duration
@@ -244,7 +249,7 @@ script:
                   - output.turn_off: motor_forward_pin
 
                 else:
-                  - logger.log: "WARNING: Battery too low! Skipping pump cycle."
+                  - logger.log: "WARNING: Battery too low (or sensor not ready)! Skipping pump cycle."
           else:
             - logger.log: "INFO: Pump is disabled via dashboard switch."
 
